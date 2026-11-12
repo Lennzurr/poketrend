@@ -1,0 +1,41 @@
+name: Relevé des prix
+
+on:
+  schedule:
+    - cron: "7 * * * *"   # toutes les heures (à hh:07, heure UTC)
+  workflow_dispatch:       # bouton « Run workflow » pour lancer à la main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: releve
+  cancel-in-progress: false
+
+jobs:
+  releve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Récupérer les relevés précédents
+        run: |
+          git clone --depth 1 --branch data \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" out \
+            || mkdir -p out
+
+      - name: Relever les prix
+        env:
+          POKEMONTCG_API_KEY: ${{ secrets.POKEMONTCG_API_KEY }}
+        run: python3 scripts/collect.py out
+
+      - name: Publier sur la branche data
+        run: |
+          cd out
+          rm -rf .git
+          git init -q -b data
+          git add -A
+          git -c user.name="PokeTrend" -c user.email="poketrend@users.noreply.github.com" \
+            commit -q -m "Relevé du $(date -u '+%Y-%m-%d %H:%M') UTC"
+          git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data
