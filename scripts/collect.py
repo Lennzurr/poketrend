@@ -23,6 +23,8 @@ IMG_PREFIX = "https://images.pokemontcg.io/"
 out = sys.argv[1] if len(sys.argv) > 1 else "out"
 os.makedirs(os.path.join(out, "hist"), exist_ok=True)
 now = int(os.environ.get("PT_NOW") or time.time())  # PT_NOW : tests uniquement
+START = time.time()
+BUDGET = float(os.environ.get("PT_BUDGET", 38 * 60))  # on arrête de charger après ~38 min pour toujours publier
 
 
 def log(*a):
@@ -107,38 +109,62 @@ sets_out = [{"id": s["id"], "name": s["name"], "series": s.get("series"),
 log(f"{len(sets_out)} extensions")
 
 # ---------------------------------------------------------------- cartes
-# Avec clé : tout, chaque heure. Sans clé (~1 000 requêtes/jour) : tout toutes les 6 h,
-# sinon seulement les 3 dernières extensions.
-full = bool(KEY) or not rows or now - state.get("lastFull", 0) >= 6 * HOUR
-query = "" if full else " OR ".join(f"set.id:{s['id']}" for s in sets_out[:3])
+# Avec clé : toutes les cartes chaque heure.
+# Sans clé (~1 000 requêtes/jour) : chaque heure, les 3 dernières extensions + 1/6 des autres pages,
+# si bien que toutes les cartes sont rafraîchies en 6 heures. Premier relevé : tout, dans la limite de temps.
 base = f"/cards?pageSize={PAGE_SIZE}&select={SELECT}&orderBy=set.releaseDate,number"
-if query:
-    base += "&q=" + urllib.parse.quote(query)
 
-first = get(base + "&page=1")
-for c in first["data"]:
-    rows[c["id"]] = row(c)
+
+def fetch(path):
+    r = get(path)
+    for c in r["data"]:
+        rows[c["id"]] = row(c)
+    return r
+
+
+def fetch_pages(b, pages, label):
+    failed, done, skipped = [], 0, 0
+    with ThreadPoolExecutor(max_workers=4 if KEY else 1) as ex:
+        futs = {}
+        for p in pages:
+            futs[ex.submit(lambda p=p: None if time.time() - START > BUDGET else fetch(b + f"&page={p}"))] = p
+        for fut in as_completed(futs):
+            try:
+                if fut.result() is None:
+                    skipped += 1
+                else:
+                    done += 1
+                    if done % 10 == 0:
+                        log(f"{label} : {done}/{len(pages)} pages")
+            except Exception as e:
+                failed.append(str(e))
+    log(f"{label} : {done} pages chargées, {len(failed)} en échec, {skipped} reportées (limite de temps)")
+    return done, failed, skipped
+
+
+first_run = not rows
+first = fetch(base + "&page=1")
 pages = -(-first["totalCount"] // PAGE_SIZE)
-log(f"{'complet' if full else 'rapide'} : {first['totalCount']} cartes, {pages} pages")
-
-
-def fetch(p):
-    return p, get(base + f"&page={p}")
-
-
-failed = []
-with ThreadPoolExecutor(max_workers=4 if KEY else 1) as ex:
-    futs = [ex.submit(fetch, p) for p in range(2, pages + 1)]
-    for fut in as_completed(futs):
-        try:
-            p, r = fut.result()
-            for c in r["data"]:
-                rows[c["id"]] = row(c)
-        except Exception as e:
-            failed.append(str(e))
-log(f"pages en échec : {len(failed)}")
-if full and len(failed) <= max(2, pages // 20):
+slot = (now // HOUR) % 6
+if KEY or first_run:
+    todo, mode = list(range(2, pages + 1)), "complet"
+else:
+    todo, mode = [p for p in range(2, pages + 1) if (p - 1) % 6 == slot], f"partiel {slot + 1}/6"
+log(f"{mode} : {first['totalCount']} cartes, {len(todo) + 1} pages sur {pages}")
+done, failed, skipped = fetch_pages(base, todo, "cartes")
+full = mode == "complet" and not failed and not skipped
+if full:
     state["lastFull"] = now
+
+if not KEY and not first_run:
+    q = " OR ".join(f"set.id:{s['id']}" for s in sets_out[:3])
+    rb = base + "&q=" + urllib.parse.quote(q)
+    try:
+        r = fetch(rb + "&page=1")
+        n = -(-r["totalCount"] // PAGE_SIZE)
+        fetch_pages(rb, list(range(2, n + 1)), "dernières extensions")
+    except Exception as e:
+        log("dernières extensions en échec :", e)
 
 # ---------------------------------------------------------------- relevé + historique
 ids = state["ids"]
@@ -191,7 +217,7 @@ for name, (target, tol, src) in refs_def.items():
     s = find(target, tol)
     refs[name] = [val(s, src, index[r[0]]) for r in card_rows] if s else None
 
-latest = {"version": 1, "updated": now, "mode": "full" if full else "light",
+latest = {"version": 1, "updated": now, "mode": mode,
           "sets": sets_out, "cards": card_rows, "refs": refs}
 with open(os.path.join(out, "latest.json"), "w", encoding="utf-8") as f:
     json.dump(latest, f, ensure_ascii=False, separators=(",", ":"))
