@@ -1,56 +1,57 @@
 #!/usr/bin/env python3
-"""Relevé horaire des prix de toutes les cartes Pokémon (pour PokéTrend).
+"""Relevé des prix de toutes les cartes Pokémon pour PokéTrend (source : TCGdex, gratuit).
 
-Lancé par GitHub Actions toutes les heures. Lit l'état précédent dans le dossier
-de sortie (branche « data »), récupère les prix sur l'API Pokémon TCG, puis écrit :
+Lancé par GitHub Actions toutes les heures. Lit l'état précédent dans le dossier de
+sortie (branche « data »), récupère les prix sur api.tcgdex.net, puis écrit :
   latest.json        cartes + prix actuels + prix de référence (il y a 1 h, 24 h, 7 j, 30 j)
   hist/<set>.json    historique des prix par extension (pour les courbes)
   history.json.gz    état interne (tous les relevés conservés)
+
+TCGdex met à jour ses prix une fois par jour (vers 22 h 30 UTC). D'où :
+  - relevé complet (toutes les cartes) une fois par jour, après cette mise à jour ;
+  - chaque heure : détection des nouvelles extensions + prix des 3 dernières sorties ;
+  - un relevé complet interrompu par la limite de temps reprend à l'heure suivante.
 Uniquement la bibliothèque standard Python.
 """
 import gzip, json, os, random, sys, time, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-API = os.environ.get("PT_API", "https://api.pokemontcg.io/v2")  # PT_API : tests uniquement
-SELECT = "id,name,number,rarity,set,images,tcgplayer,cardmarket"
-PAGE_SIZE = 250
-KEY = os.environ.get("POKEMONTCG_API_KEY", "").strip()
+API = os.environ.get("PT_API", "https://api.tcgdex.net/v2/en")  # PT_API : tests uniquement
+IMG_BASE = "https://assets.tcgdex.net/"
 HOUR, DAY = 3600, 86400
-TCG_ORDER = ["holofoil", "normal", "reverseHolofoil", "1stEditionHolofoil",
-             "1stEditionNormal", "unlimitedHolofoil", "1stEdition", "unlimited"]
-IMG_PREFIX = "https://images.pokemontcg.io/"
+FULL_HOUR_UTC = 23          # relevé complet du jour (la source se met à jour vers 22 h 30 UTC)
+WORKERS = 6                 # requêtes en parallèle (rester raisonnable avec un service gratuit)
+TCG_ORDER = ["holofoil", "normal", "reverse-holofoil", "1st-edition-holofoil", "1st-edition",
+             "unlimited-holofoil", "unlimited", "1st-edition-normal"]
 
 out = sys.argv[1] if len(sys.argv) > 1 else "out"
 os.makedirs(os.path.join(out, "hist"), exist_ok=True)
 now = int(os.environ.get("PT_NOW") or time.time())  # PT_NOW : tests uniquement
 START = time.time()
 BUDGET = float(os.environ.get("PT_BUDGET", 38 * 60))  # on arrête de charger après ~38 min pour toujours publier
+SLEEP = float(os.environ.get("PT_SLEEP_SCALE", "1"))
 
 
 def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
-def get(path, tries=12):
-    """GET avec réessais : l'API renvoie souvent des erreurs passagères."""
-    headers = {"User-Agent": "PokeTrend-collector/1.0"}
-    if KEY:
-        headers["X-Api-Key"] = KEY
+def get(path, tries=8):
     last = None
     for attempt in range(tries):
         try:
-            req = urllib.request.Request(API + path, headers=headers)
-            with urllib.request.urlopen(req, timeout=60) as r:
+            req = urllib.request.Request(API + path, headers={"User-Agent": "PokeTrend-collector/2.0"})
+            with urllib.request.urlopen(req, timeout=45) as r:
                 return json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             last = e
-            if e.code in (401, 403):
-                raise SystemExit(f"Clé API refusée ({e.code}). Vérifie le secret POKEMONTCG_API_KEY.")
+            if e.code == 404:
+                return None
             if e.code == 429:
-                time.sleep(20)
-        except Exception as e:  # réseau, délai dépassé, JSON tronqué…
+                time.sleep(15 * SLEEP)
+        except Exception as e:
             last = e
-        time.sleep(float(os.environ.get("PT_SLEEP_SCALE", "1")) * (1.5 + random.random() * 2.5 + attempt * 0.5))
+        time.sleep(SLEEP * (1 + random.random() * 2 + attempt))
     raise RuntimeError(f"échec après {tries} essais : {path} ({last})")
 
 
@@ -58,113 +59,126 @@ def num(v):
     return round(float(v), 2) if isinstance(v, (int, float)) and v > 0 else None
 
 
-def tcg_main(t):
-    p = (t or {}).get("prices") or {}
-    for k in TCG_ORDER:
-        if num((p.get(k) or {}).get("market")):
-            return num(p[k]["market"])
-    for v in p.values():
-        if num((v or {}).get("market")):
-            return num(v["market"])
-    for v in p.values():
-        if num((v or {}).get("mid")):
-            return num(v["mid"])
-    return None
-
-
 def row(c):
+    """Ligne compacte : [id, nom, numéro, rareté, set, image, cmTendance, cmMoy1, cmMoy7, cmMoy30, cmBas, tcgMarché, idCardmarket, idTcgplayer]"""
     s = c.get("set") or {}
-    cm = (c.get("cardmarket") or {}).get("prices") or {}
-    img = ((c.get("images") or {}).get("small") or "")
-    default = f"{IMG_PREFIX}{s.get('id')}/{c.get('number')}.png"
-    img = "" if img == default else img.replace(IMG_PREFIX, "")
-    return [c["id"], c.get("name"), c.get("number"), c.get("rarity") or "—", s.get("id"), img,
-            num(cm.get("trendPrice")) or num(cm.get("averageSellPrice")),
-            num(cm.get("avg1")), num(cm.get("avg7")), num(cm.get("avg30")), num(cm.get("lowPrice")),
-            tcg_main(c.get("tcgplayer"))]
+    pr = c.get("pricing") or {}
+    cm = pr.get("cardmarket") or {}
+    # Cardmarket : version normale si elle a un prix, sinon version holo
+    sfx = "" if num(cm.get("trend")) or num(cm.get("avg")) else "-holo"
+    cm_trend = num(cm.get("trend" + sfx)) or num(cm.get("avg" + sfx))
+    tp = pr.get("tcgplayer") or {}
+    tcg, tcg_id = None, None
+    variants = [k for k in TCG_ORDER if isinstance(tp.get(k), dict)] + \
+               [k for k, v in tp.items() if isinstance(v, dict) and k not in TCG_ORDER]
+    for k in variants:
+        m = num(tp[k].get("marketPrice")) or num(tp[k].get("midPrice"))
+        if m:
+            tcg, tcg_id = m, tp[k].get("productId")
+            break
+    img = c.get("image") or ""
+    if img.startswith(IMG_BASE):
+        img = img[len(IMG_BASE):]
+    return [c["id"], c.get("name"), c.get("localId"), c.get("rarity") or "—", s.get("id"), img,
+            cm_trend, num(cm.get("avg1" + sfx)), num(cm.get("avg7" + sfx)), num(cm.get("avg30" + sfx)),
+            num(cm.get("low" + sfx)), tcg, cm.get("idProduct"), tcg_id]
 
 
 # ---------------------------------------------------------------- état précédent
 state_path = os.path.join(out, "history.json.gz")
-state = {"ids": [], "snaps": [], "lastFull": 0, "rows": {}}
+fresh_state = {"source": "tcgdex", "ids": [], "snaps": [], "lastFull": 0, "rows": {}, "sets": {}, "pending": []}
+state = dict(fresh_state)
 if os.path.exists(state_path):
     try:
         with gzip.open(state_path, "rt", encoding="utf-8") as f:
-            state.update(json.load(f))
-        log(f"état précédent : {len(state['ids'])} cartes, {len(state['snaps'])} relevés")
+            old = json.load(f)
+        if old.get("source") == "tcgdex":
+            state.update(old)
+            log(f"état précédent : {len(state['rows'])} cartes, {len(state['snaps'])} relevés, {len(state['pending'])} en attente")
+        else:
+            log("ancien format (API Pokémon TCG, prix figés) : on repart de zéro avec TCGdex")
     except Exception as e:
         log("état précédent illisible, on repart de zéro :", e)
-rows = state["rows"]  # id -> ligne (dernière valeur connue)
+rows, set_info = state["rows"], state["sets"]
 
 # ---------------------------------------------------------------- extensions
-sets, page = [], 1
-while True:
-    r = get(f"/sets?page={page}&pageSize=250&orderBy=-releaseDate")
-    sets += r["data"]
-    if len(sets) >= r["totalCount"] or not r["data"]:
-        break
-    page += 1
-sets_out = [{"id": s["id"], "name": s["name"], "series": s.get("series"),
-             "date": (s.get("releaseDate") or "").replace("/", "-"), "total": s.get("total")} for s in sets]
-log(f"{len(sets_out)} extensions")
-
-# ---------------------------------------------------------------- cartes
-# Avec clé : toutes les cartes chaque heure.
-# Sans clé (~1 000 requêtes/jour) : chaque heure, les 3 dernières extensions + 1/6 des autres pages,
-# si bien que toutes les cartes sont rafraîchies en 6 heures. Premier relevé : tout, dans la limite de temps.
-base = f"/cards?pageSize={PAGE_SIZE}&select={SELECT}&orderBy=set.releaseDate,number"
+sets = get("/sets") or []
+new_sets = [s["id"] for s in sets if s["id"] not in set_info]
+log(f"{len(sets)} extensions, {len(new_sets)} à détailler")
 
 
-def fetch(path):
-    r = get(path)
-    for c in r["data"]:
-        rows[c["id"]] = row(c)
-    return r
+def set_detail(sid):
+    d = get("/sets/" + urllib.parse.quote(sid)) or {}
+    return sid, {"name": d.get("name"), "series": (d.get("serie") or {}).get("name"),
+                 "date": d.get("releaseDate") or "", "total": (d.get("cardCount") or {}).get("total"),
+                 "cards": [c["id"] for c in d.get("cards") or []]}
 
 
-def fetch_pages(b, pages, label):
-    failed, done, skipped = [], 0, 0
-    with ThreadPoolExecutor(max_workers=4 if KEY else 1) as ex:
-        futs = {}
-        for p in pages:
-            futs[ex.submit(lambda p=p: None if time.time() - START > BUDGET else fetch(b + f"&page={p}"))] = p
-        for fut in as_completed(futs):
-            try:
-                if fut.result() is None:
-                    skipped += 1
-                else:
-                    done += 1
-                    if done % 10 == 0:
-                        log(f"{label} : {done}/{len(pages)} pages")
-            except Exception as e:
-                failed.append(str(e))
-    log(f"{label} : {done} pages chargées, {len(failed)} en échec, {skipped} reportées (limite de temps)")
-    return done, failed, skipped
+with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+    for fut in as_completed([ex.submit(set_detail, sid) for sid in new_sets]):
+        try:
+            sid, info = fut.result()
+            set_info[sid] = info
+        except Exception as e:
+            log("extension en échec :", e)
+sets_sorted = sorted(set_info.items(), key=lambda kv: kv[1].get("date") or "", reverse=True)
+sets_out = [{"id": sid, "name": i["name"], "series": i["series"], "date": i["date"], "total": i["total"]}
+            for sid, i in sets_sorted]
 
-
+# ---------------------------------------------------------------- cartes à relever
+hour = time.gmtime(now).tm_hour
+all_ids = [c["id"] for c in (get("/cards") or [])]
 first_run = not rows
-first = fetch(base + "&page=1")
-pages = -(-first["totalCount"] // PAGE_SIZE)
-slot = (now // HOUR) % 6
-if KEY or first_run:
-    todo, mode = list(range(2, pages + 1)), "complet"
+full_due = first_run or (hour == FULL_HOUR_UTC and now - state["lastFull"] > 12 * HOUR) or now - state["lastFull"] > 26 * HOUR
+recent_ids = [cid for sid, i in sets_sorted[:3] for cid in i.get("cards", [])]
+if full_due:
+    todo, mode = all_ids, "complet"
 else:
-    todo, mode = [p for p in range(2, pages + 1) if (p - 1) % 6 == slot], f"partiel {slot + 1}/6"
-log(f"{mode} : {first['totalCount']} cartes, {len(todo) + 1} pages sur {pages}")
-done, failed, skipped = fetch_pages(base, todo, "cartes")
-full = mode == "complet" and not failed and not skipped
-if full:
-    state["lastFull"] = now
+    todo = list(dict.fromkeys(state["pending"] + recent_ids))  # reprise d'un relevé complet interrompu + dernières sorties
+    mode = "reprise + dernières extensions" if state["pending"] else "dernières extensions"
+all_set = set(all_ids)
+todo = [cid for cid in todo if cid in all_set] if all_ids else todo
+log(f"{mode} : {len(todo)} cartes à relever (sur {len(all_ids)})")
 
-if not KEY and not first_run:
-    q = " OR ".join(f"set.id:{s['id']}" for s in sets_out[:3])
-    rb = base + "&q=" + urllib.parse.quote(q)
+
+def fetch(cid):
+    if time.time() - START > BUDGET:
+        return cid, "skip"
     try:
-        r = fetch(rb + "&page=1")
-        n = -(-r["totalCount"] // PAGE_SIZE)
-        fetch_pages(rb, list(range(2, n + 1)), "dernières extensions")
-    except Exception as e:
-        log("dernières extensions en échec :", e)
+        return cid, get("/cards/" + urllib.parse.quote(cid))
+    except Exception:
+        return cid, "fail"
+
+
+done, failed, skipped = 0, [], []
+with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+    futs = [ex.submit(fetch, cid) for cid in todo]
+    for fut in as_completed(futs):
+        try:
+            cid, c = fut.result()
+            if c == "skip":
+                skipped.append(cid)
+                continue
+            if c == "fail":
+                failed.append(cid)
+                continue
+            if c:
+                rows[cid] = row(c)
+            done += 1
+            if done % 2000 == 0:
+                log(f"{done}/{len(todo)} cartes")
+        except Exception as e:
+            log("erreur inattendue :", e)
+log(f"{done} cartes relevées, {len(failed)} en échec, {len(skipped)} reportées (limite de temps)")
+todo_set = set(todo)
+pending_left = [cid for cid in state["pending"] if cid not in todo_set]
+state["pending"] = list(dict.fromkeys(pending_left + skipped + failed))  # repris aux heures suivantes
+if mode == "complet":
+    state["lastFull"] = now
+if all_ids:
+    for cid in list(rows):  # cartes retirées de la base
+        if cid not in all_set:
+            rows.pop(cid)
 
 # ---------------------------------------------------------------- relevé + historique
 ids = state["ids"]
@@ -217,24 +231,22 @@ for name, (target, tol, src) in refs_def.items():
     s = find(target, tol)
     refs[name] = [val(s, src, index[r[0]]) for r in card_rows] if s else None
 
-latest = {"version": 1, "updated": now, "mode": mode,
+latest = {"version": 2, "source": "tcgdex", "imgBase": IMG_BASE, "updated": now, "mode": mode,
           "sets": sets_out, "cards": card_rows, "refs": refs}
 with open(os.path.join(out, "latest.json"), "w", encoding="utf-8") as f:
     json.dump(latest, f, ensure_ascii=False, separators=(",", ":"))
 
-# Historique par extension (pour les courbes de PokéTrend)
 by_set = {}
 for r in card_rows:
     by_set.setdefault(r[4], []).append(r[0])
 ts = [s["ts"] for s in kept]
+for name in os.listdir(os.path.join(out, "hist")):
+    os.remove(os.path.join(out, "hist", name))
 for set_id, cids in by_set.items():
-    c = {}
-    for cid in cids:
-        i = index[cid]
-        c[cid] = [[val(s, "cm", i) for s in kept], [val(s, "tcg", i) for s in kept]]
+    c = {cid: [[val(s, "cm", index[cid]) for s in kept], [val(s, "tcg", index[cid]) for s in kept]] for cid in cids}
     with open(os.path.join(out, "hist", f"{set_id}.json"), "w", encoding="utf-8") as f:
         json.dump({"ts": ts, "c": c}, f, separators=(",", ":"))
 
 with gzip.open(state_path, "wt", encoding="utf-8") as f:
     json.dump(state, f, separators=(",", ":"))
-log(f"terminé : {len(card_rows)} cartes, {len(kept)} relevés en historique")
+log(f"terminé : {len(card_rows)} cartes, {len(kept)} relevés en historique, {len(state['pending'])} en attente")
